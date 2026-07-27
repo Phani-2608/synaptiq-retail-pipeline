@@ -352,14 +352,5 @@ reference, but chose to quarantine it because silently inventing revenue
 would be more difficult to detect downstream than visibly excluding one
 unusable record.
 
-I validated the final result using the in-pipeline reconciliation checks,
-repeated clean runs, targeted parser tests, and an independent
-recomputation of the aggregate. No credentials, confidential client data,
-or sensitive information were shared with the AI tool.
+I validated the final result using the in-pipeline reconciliation checks in §8, repeated clean runs, targeted parser tests, and an independent recomputation of the aggregate that I compared with the Gold output row by row. The platform-specific behaviors described in §7 were handled consistently: reproduce the issue, understand the mechanism, apply the documented fix, and verify the result rather than accepting the first suggestion. No credentials, confidential client data, or sensitive information were shared with the AI tool.
 
-Validation throughout was twofold: the reconciliation invariants that run in-pipeline
-(§8), and an independent recomputation of the full aggregate that I diffed against
-the Gold output row by row. The three platform behaviours in §7 were each found and
-resolved the same way: reproduce, understand the mechanism, apply the documented fix
-— not accept a first suggestion without checking it against what Databricks' own
-error messages and documentation say.
