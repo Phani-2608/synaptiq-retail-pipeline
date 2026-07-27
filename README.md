@@ -11,6 +11,21 @@ business date x product category x region.
 See **NOTES.md** for the full write-up: output tables, design rationale,
 assumptions, data-quality decisions, three Databricks/Delta platform behaviours
 found while building this, and the AI-assisted-development disclosure.
+What this is, in plain terms
+
+Every day, a retailer drops a spreadsheet of that day's orders into a folder. This project turns that daily drop into a always-up-to-date sales report — broken down by day, product type, and region — automatically, with no one having to run anything by hand.
+
+Three things make this more than a simple import script:
+
+It never double-counts. The same order sometimes shows up in two different daily files (a "did you get this?" resend). The system recognizes that and keeps exactly one correct copy — instead of accidentally counting that sale twice.
+It fixes yesterday's numbers when new information arrives. If a customer changes an order today, and that order was originally placed three days ago, the report for that earlier day updates itself to reflect the correction — nobody has to remember to go back and fix it manually.
+It doesn't hide problems, it flags them. A handful of orders reference a product that doesn't exist in the product list yet, or are missing a price. Rather than silently deleting that revenue (which would make the sales numbers look clean while quietly being wrong), the system keeps that money visible under an "Unknown" label and puts the truly unusable rows in a separate holding area for someone to review — so nothing disappears without a trace.
+
+I tested this by actually running it — including simulating three days of real order files, one of which corrects an earlier day's order — and confirmed the numbers come out right, are reproducible, and update correctly on their own the moment a new file arrives.
+
+End-to-end Databricks pipeline (medallion architecture, serverless, file-arrival trigger) processing daily order CSVs and a product reference file into an analytics-ready Gold table: net revenue, order count, units sold, and AOV, by business date x product category x region.
+
+See NOTES.md for the full write-up: output tables, design rationale, assumptions, data-quality decisions, three Databricks/Delta platform behaviours found while building this, and the AI-assisted-development disclosure.
 
 ## Structure
 
