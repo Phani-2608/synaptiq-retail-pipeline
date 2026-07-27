@@ -342,10 +342,20 @@ I used Claude as a pair-programmer to accelerate scaffolding and to pressure-tes
 design decisions, and validated everything against an independent check rather than
 trusting output directly.
 
-[Replace this paragraph with your own account — this is the one section a reviewer
-will weight most on truthfulness. Be specific: name one thing the AI's first draft
-got wrong that you caught against the actual data, one decision you made differently
-than what it initially suggested and why, and how you verified the final numbers.]
+Concretely, the initial deduplication approach suggested by the AI did not
+distinguish the byte-identical O1002 re-send from the updated O1003
+restatement. I caught this by reviewing the supplied records and replaced
+the logic with a source-ordered MERGE on order_id.
+
+I also considered imputing O2009's missing unit price from the product
+reference, but chose to quarantine it because silently inventing revenue
+would be more difficult to detect downstream than visibly excluding one
+unusable record.
+
+I validated the final result using the in-pipeline reconciliation checks,
+repeated clean runs, targeted parser tests, and an independent
+recomputation of the aggregate. No credentials, confidential client data,
+or sensitive information were shared with the AI tool.
 
 Validation throughout was twofold: the reconciliation invariants that run in-pipeline
 (§8), and an independent recomputation of the full aggregate that I diffed against
