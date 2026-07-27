@@ -38,57 +38,66 @@ AUDIT         = f"{CATALOG}.gold.pipeline_run_audit"
 dates = [r.order_date for r in
          spark.table(REFRESH_QUEUE).select("order_date").distinct().collect()]
 
+# Guarded with if/else rather than dbutils.notebook.exit(), deliberately.
+# notebook.exit() only halts execution when this notebook is invoked as a
+# scheduled Job task or via dbutils.notebook.run() from a parent notebook — it
+# does NOT stop execution when a person clicks "Run all" interactively in the
+# UI. Relying on it caused a real NameError during development: an empty queue
+# printed the exit message and then fell straight through into cells that
+# assumed date_list existed. Wrapping the whole rebuild in one guarded block
+# makes this notebook behave identically whether it's run by a human, by
+# "Run all", or by the Job — there's nothing downstream left to skip past.
 if not dates:
-    dbutils.notebook.exit("No dates queued — Gold is already current.")
+    print("No dates queued — Gold is already current. Skipping rebuild.")
+else:
+    date_list = ", ".join(f"DATE'{d}'" for d in sorted(dates))
+    print(f"Rebuilding {len(dates)} business date(s): {date_list}")
 
-date_list = ", ".join(f"DATE'{d}'" for d in sorted(dates))
-print(f"Rebuilding {len(dates)} business date(s): {date_list}")
+    # COMMAND ----------
 
-# COMMAND ----------
+    # MAGIC %md
+    # MAGIC ## The aggregate
+    # MAGIC
+    # MAGIC **`LEFT JOIN`, not inner.** Two order rows reference products (`P099`, `P011`) that
+    # MAGIC do not exist in the reference file. An inner join would delete them and their
+    # MAGIC revenue, and nothing in the output would indicate anything was missing. They land
+    # MAGIC in category `Unknown` instead, so the books still tie and the gap becomes a visible
+    # MAGIC data-quality ticket for whoever owns the product master.
+    # MAGIC
+    # MAGIC **AOV caveat.** AOV is computed within each date × category × region cell. An order
+    # MAGIC spanning two categories would count toward both, so these AOVs do not roll up by
+    # MAGIC summation. In this dataset every order has exactly one line, so the distinction is
+    # MAGIC currently invisible — which is precisely why it belongs in the notes rather than
+    # MAGIC being discovered later by an analyst.
 
-# MAGIC %md
-# MAGIC ## The aggregate
-# MAGIC
-# MAGIC **`LEFT JOIN`, not inner.** Two order rows reference products (`P099`, `P011`) that
-# MAGIC do not exist in the reference file. An inner join would delete them and their
-# MAGIC revenue, and nothing in the output would indicate anything was missing. They land
-# MAGIC in category `Unknown` instead, so the books still tie and the gap becomes a visible
-# MAGIC data-quality ticket for whoever owns the product master.
-# MAGIC
-# MAGIC **AOV caveat.** AOV is computed within each date × category × region cell. An order
-# MAGIC spanning two categories would count toward both, so these AOVs do not roll up by
-# MAGIC summation. In this dataset every order has exactly one line, so the distinction is
-# MAGIC currently invisible — which is precisely why it belongs in the notes rather than
-# MAGIC being discovered later by an analyst.
+    # COMMAND ----------
 
-# COMMAND ----------
+    agg = spark.sql(f"""
+        SELECT
+            o.order_date,
+            COALESCE(p.category, 'Unknown')                    AS category,
+            o.region,
+            CAST(SUM(o.line_revenue) AS DECIMAL(18,2))         AS net_revenue,
+            COUNT(DISTINCT o.order_id)                         AS order_count,
+            CAST(SUM(o.quantity) AS BIGINT)                    AS units_sold,
+            CAST(SUM(o.line_revenue) / NULLIF(COUNT(DISTINCT o.order_id), 0)
+                 AS DECIMAL(18,2))                             AS aov,
+            CURRENT_TIMESTAMP()                                AS _refreshed_at
+        FROM {SILVER_ORDERS} o
+        LEFT JOIN {PRODUCTS} p
+               ON o.product_id = p.product_id
+        WHERE o.order_date IN ({date_list})
+        GROUP BY o.order_date, COALESCE(p.category, 'Unknown'), o.region
+    """)
 
-agg = spark.sql(f"""
-    SELECT
-        o.order_date,
-        COALESCE(p.category, 'Unknown')                    AS category,
-        o.region,
-        CAST(SUM(o.line_revenue) AS DECIMAL(18,2))         AS net_revenue,
-        COUNT(DISTINCT o.order_id)                         AS order_count,
-        CAST(SUM(o.quantity) AS BIGINT)                    AS units_sold,
-        CAST(SUM(o.line_revenue) / NULLIF(COUNT(DISTINCT o.order_id), 0)
-             AS DECIMAL(18,2))                             AS aov,
-        CURRENT_TIMESTAMP()                                AS _refreshed_at
-    FROM {SILVER_ORDERS} o
-    LEFT JOIN {PRODUCTS} p
-           ON o.product_id = p.product_id
-    WHERE o.order_date IN ({date_list})
-    GROUP BY o.order_date, COALESCE(p.category, 'Unknown'), o.region
-""")
+    (agg.write
+        .format("delta")
+        .mode("overwrite")
+        .option("replaceWhere", f"order_date IN ({date_list})")
+        .saveAsTable(GOLD))
 
-(agg.write
-    .format("delta")
-    .mode("overwrite")
-    .option("replaceWhere", f"order_date IN ({date_list})")
-    .saveAsTable(GOLD))
-
-spark.sql(f"DELETE FROM {REFRESH_QUEUE} WHERE order_date IN ({date_list})")
-print("Gold rebuilt; queue cleared.")
+    spark.sql(f"DELETE FROM {REFRESH_QUEUE} WHERE order_date IN ({date_list})")
+    print("Gold rebuilt; queue cleared.")
 
 # COMMAND ----------
 
