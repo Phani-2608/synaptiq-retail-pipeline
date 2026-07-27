@@ -1,0 +1,7 @@
+order_id,order_date,customer_id,product_id,quantity,unit_price,region
+O3001,2024-01-03,C021,P001,2,$24.99,North
+O3002,2024-01-03,C022,P009,1,39.00,West
+O2008,2024-01-02,C018,P008,6,9.99,East
+O3003,1704240000,C023,P007,1,"$1,049.95",south
+O3004,2024-01-03,C024,P012,1,15.00,East
+O3005,2024-01-03,C025,P003,-2,3.50,North

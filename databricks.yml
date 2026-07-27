@@ -1,0 +1,117 @@
+# Databricks Asset Bundle — deployable definition of the pipeline job.
+#
+# The job was created through the UI for this exercise, but a job that only exists
+# as clicks in a workspace cannot be code-reviewed, diffed, or promoted between
+# environments. This file is the same job as version-controlled configuration:
+#
+#   databricks bundle validate
+#   databricks bundle deploy -t dev
+#   databricks bundle deploy -t prod
+#
+# Included as evidence of how I'd actually ship this, not as a required step to
+# reproduce the results.
+
+bundle:
+  name: retail_daily_sales
+
+variables:
+  catalog:
+    description: Target Unity Catalog. Overridden per environment.
+    default: retail
+
+targets:
+  # Development deploys are prefixed and paused, so deploying from a feature
+  # branch cannot fire a job that writes to the shared catalog.
+  dev:
+    mode: development
+    default: true
+    variables:
+      catalog: retail_dev
+
+  prod:
+    mode: production
+    variables:
+      catalog: retail
+
+resources:
+  jobs:
+    daily_sales_pipeline:
+      name: retail_daily_sales_pipeline
+      description: >
+        Ingests the daily order drop, conforms and deduplicates it, and rebuilds the
+        affected business dates in the Gold sales aggregate.
+
+      # Event-driven rather than cron. The upstream system drops "once per day" but
+      # gives no guarantee of when, so a fixed schedule either runs before the file
+      # lands or wastes compute waiting for it.
+      #
+      # Scoped to the orders/ subpath deliberately: the trigger scans recursively,
+      # and pipeline checkpoints live in a separate volume so that the job's own
+      # writes can never re-trigger it.
+      trigger:
+        file_arrival:
+          url: /Volumes/${var.catalog}/landing/inbox/orders/
+          # Debounce: wait for the write to settle before firing, so a large file
+          # still being uploaded is not read half-written.
+          wait_after_last_change_seconds: 30
+          min_time_between_triggers_seconds: 60
+
+      # Concurrent runs would race each other's MERGE into silver.orders.
+      # Queue rather than drop, so a file landing mid-run is still processed.
+      max_concurrent_runs: 1
+      queue:
+        enabled: true
+
+      timeout_seconds: 3600
+
+      email_notifications:
+        on_failure:
+          - CHANGE_ME@example.com
+        # Deliberately silent on success. An alert that fires every day is an alert
+        # nobody reads by week three.
+
+      tasks:
+        - task_key: bronze_ingest
+          description: Auto Loader picks up unprocessed files and appends them to Bronze.
+          # Retried, not the other two tasks. A failure here is almost always
+          # transient (cloud storage listing hiccup, a large file still settling
+          # on write) and Auto Loader's checkpoint makes a retry safe — it will
+          # not reprocess anything already committed.
+          max_retries: 2
+          min_retry_interval_millis: 30000
+          notebook_task:
+            notebook_path: ../notebooks/01_bronze_ingest.py
+            base_parameters:
+              catalog: ${var.catalog}
+
+        - task_key: silver
+          description: Parse, validate, quarantine, and upsert on order_id.
+          depends_on:
+            - task_key: bronze_ingest
+          notebook_task:
+            notebook_path: ../notebooks/02_silver.py
+            base_parameters:
+              catalog: ${var.catalog}
+          # Deliberately NOT retried. A failure here is more likely a real data
+          # or logic problem (a MERGE conflict, a constraint violation) than a
+          # transient one, and retrying a task that just wrote a partial MERGE
+          # is a correctness question I want a human to look at, not a policy
+          # to paper over automatically.
+
+        - task_key: gold
+          description: Rebuild only the business dates this batch invalidated.
+          depends_on:
+            - task_key: silver
+          notebook_task:
+            notebook_path: ../notebooks/03_gold.py
+            base_parameters:
+              catalog: ${var.catalog}
+          # Gold ends with reconciliation asserts (Bronze-vs-Silver row balance,
+          # Silver key uniqueness, Gold-vs-Silver revenue tie-out). A failure
+          # here means something is provably wrong, and the run should fail
+          # loudly rather than publish numbers that do not tie back to source
+          # — so this task is also not auto-retried.
+
+# No job_clusters block: all tasks run on serverless compute. On a client engagement
+# with classic compute I would attach a cluster policy here instead, both to cap DBU
+# spend and to stop the job silently upgrading to a larger node type over time.

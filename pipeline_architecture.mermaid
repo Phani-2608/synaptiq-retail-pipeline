@@ -1,0 +1,82 @@
+flowchart TD
+
+subgraph SRC["1 - SOURCE : daily drop"]
+    A1["orders_YYYY-MM-DD.csv<br/>one file per day, same shape"]
+    A2["products.xlsx<br/>reference data, changes rarely"]
+end
+
+subgraph ING["2 - INGEST"]
+    B1["Auto Loader - cloudFiles<br/>file-arrival trigger, not a cron<br/>schemaEvolutionMode = rescue<br/>exactly-once file tracking"]
+end
+
+subgraph BRZ["3 - BRONZE : raw and immutable"]
+    C1["bronze.orders_raw<br/>every column read as STRING<br/>plus _source_file, _ingested_at, _rescued_data"]
+    C2["bronze.products_raw"]
+end
+
+subgraph VAL["4 - PARSE and VALIDATE"]
+    D1["multi-format parsers<br/>date : ISO / MM-DD-YYYY / unix epoch<br/>price : strip currency symbol and thousands comma"]
+    D2{"row meets<br/>the contract?"}
+end
+
+subgraph QTN["QUARANTINE - nothing is silently dropped"]
+    E1["silver.orders_quarantine<br/>plus reject_reason and _source_file<br/>ragged rows, unparseable date,<br/>missing unit_price"]
+end
+
+subgraph SLV["5 - SILVER : conformed and deduplicated"]
+    F1["canonicalise region and category<br/>west becomes West, kitchen becomes Kitchen<br/>missing region becomes Unknown"]
+    F2["MERGE INTO silver.orders ON order_id<br/>update only when the incoming row<br/>is newer than the stored row<br/>= idempotent, safe to replay"]
+    F3["silver.products<br/>canonical category, one row per product"]
+end
+
+subgraph LATE["6 - LATE-ARRIVING FACT HANDLER"]
+    G1["day 2's file restates an order<br/>dated day 1, so day 1's answer changes"]
+    G2["collect DISTINCT order_date<br/>touched by this batch<br/>= the partitions to rebuild"]
+end
+
+subgraph GLD["7 - GOLD : the analyst-facing table"]
+    H1["LEFT JOIN silver.orders to silver.products<br/>unmatched product ids land in category Unknown<br/>so no revenue disappears"]
+    H2["gold.daily_sales_by_category_region<br/>grain : order_date x category x region<br/>net_revenue, order_count, units_sold, aov<br/>written with replaceWhere on affected dates"]
+end
+
+subgraph AUD["8 - AUDIT : the trust layer"]
+    I1["gold.pipeline_run_reconciliation<br/>rows_in = rows_loaded + rows_quarantined<br/>revenue tie-out per run<br/>plus Delta time travel for 'why did Monday change?'"]
+end
+
+subgraph SRV["9 - SERVE"]
+    J1["PowerBI DirectQuery<br/>via serverless SQL warehouse"]
+    J2["Genie space<br/>self-serve analyst questions"]
+end
+
+A1 --> B1
+A2 --> B1
+B1 --> C1
+B1 --> C2
+C1 --> D1
+D1 --> D2
+D2 -->|"fail"| E1
+D2 -->|"pass"| F1
+F1 --> F2
+C2 --> F3
+F2 --> G2
+G1 -.->|"the core problem"| G2
+G2 --> H1
+F3 --> H1
+H1 --> H2
+F2 --> I1
+E1 --> I1
+H2 --> J1
+H2 --> J2
+I1 --> J1
+
+classDef bronze fill:#f5e6d3,stroke:#8b6f47,color:#3d2f1f
+classDef silver fill:#e8eaed,stroke:#6b7280,color:#1f2937
+classDef gold fill:#fdf0c8,stroke:#b8860b,color:#3d3011
+classDef reject fill:#fae3e3,stroke:#b91c1c,color:#4a1010
+classDef audit fill:#e0f0e9,stroke:#166534,color:#0f2f1c
+
+class C1,C2 bronze
+class F1,F2,F3,D1,D2 silver
+class H1,H2 gold
+class E1 reject
+class I1,G1,G2 audit
