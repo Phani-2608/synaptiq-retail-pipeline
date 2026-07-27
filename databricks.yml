@@ -9,7 +9,10 @@
 #   databricks bundle deploy -t prod
 #
 # Included as evidence of how I'd actually ship this, not as a required step to
-# reproduce the results.
+# reproduce the results. Notebook paths below are relative to this repo's flat
+# layout (all files at root); a real deployment would likely split notebooks/
+# and resources/ into subfolders, but I kept this repo's structure simple for
+# review.
 
 bundle:
   name: retail_daily_sales
@@ -80,7 +83,7 @@ resources:
           max_retries: 2
           min_retry_interval_millis: 30000
           notebook_task:
-            notebook_path: ../notebooks/01_bronze_ingest.py
+            notebook_path: ./01_bronze_ingest.py
             base_parameters:
               catalog: ${var.catalog}
 
@@ -89,7 +92,7 @@ resources:
           depends_on:
             - task_key: bronze_ingest
           notebook_task:
-            notebook_path: ../notebooks/02_silver.py
+            notebook_path: ./02_silver.py
             base_parameters:
               catalog: ${var.catalog}
           # Deliberately NOT retried. A failure here is more likely a real data
@@ -103,7 +106,7 @@ resources:
           depends_on:
             - task_key: silver
           notebook_task:
-            notebook_path: ../notebooks/03_gold.py
+            notebook_path: ./03_gold.py
             base_parameters:
               catalog: ${var.catalog}
           # Gold ends with reconciliation asserts (Bronze-vs-Silver row balance,
