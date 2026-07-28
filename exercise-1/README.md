@@ -66,10 +66,7 @@ NOTES.md                  Full write-up
 4. The output table and full reconciliation are in NOTES.md §1 (official two-file
    result) and §2 (trigger demonstration with a third, synthetic file).
 
-For a scheduled deployment: `databricks bundle deploy -t dev` (or `-t prod`), using
-the included `databricks.yml`. The job triggers on file arrival in
-`/Volumes/<catalog>/landing/inbox/orders/` rather than on a fixed schedule — see
-NOTES.md §6 for why.
+For a scheduled deployment: `databricks bundle deploy -t dev` (or `-t prod`), using the included `databricks.yml`. The job triggers on new file arrival under `/Volumes/<catalog>/landing/inbox/`, covering both `orders/` and `reference/`, rather than running on a fixed schedule.
 
 ## Tests
 
