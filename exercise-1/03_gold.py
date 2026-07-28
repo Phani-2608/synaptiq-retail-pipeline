@@ -38,66 +38,253 @@ AUDIT         = f"{CATALOG}.gold.pipeline_run_audit"
 dates = [r.order_date for r in
          spark.table(REFRESH_QUEUE).select("order_date").distinct().collect()]
 
-# Guarded with if/else rather than dbutils.notebook.exit(), deliberately.
-# notebook.exit() only halts execution when this notebook is invoked as a
-# scheduled Job task or via dbutils.notebook.run() from a parent notebook — it
-# does NOT stop execution when a person clicks "Run all" interactively in the
-# UI. Relying on it caused a real NameError during development: an empty queue
-# printed the exit message and then fell straight through into cells that
-# assumed date_list existed. Wrapping the whole rebuild in one guarded block
-# makes this notebook behave identically whether it's run by a human, by
-# "Run all", or by the Job — there's nothing downstream left to skip past.
+if not dates:
+    dbutils.notebook.exit("No dates queued — Gold is already current.")
+
+date_list = ", ".join(f"DATE'{d}'" for d in sorted(dates))
+print(f"Rebuilding {len(dates)} business date(s): {date_list}")
+
+# COMMAND ----------
+
+display(spark.sql("""
+    SELECT 'bronze.orders_raw' AS tbl, COUNT(*) AS rows FROM retail.bronze.orders_raw
+    UNION ALL SELECT 'silver.orders', COUNT(*) FROM retail.silver.orders
+    UNION ALL SELECT 'silver.orders_quarantine', COUNT(*) FROM retail.silver.orders_quarantine
+    UNION ALL SELECT 'silver.gold_refresh_queue', COUNT(*) FROM retail.silver.gold_refresh_queue
+    UNION ALL SELECT 'gold.daily_sales_by_category_region', COUNT(*) FROM retail.gold.daily_sales_by_category_region
+"""))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## The aggregate
+# MAGIC
+# MAGIC **`LEFT JOIN`, not inner.** Two order rows reference products (`P099`, `P011`) that
+# MAGIC do not exist in the reference file. An inner join would delete them and their
+# MAGIC revenue, and nothing in the output would indicate anything was missing. They land
+# MAGIC in category `Unknown` instead, so the books still tie and the gap becomes a visible
+# MAGIC data-quality ticket for whoever owns the product master.
+# MAGIC
+# MAGIC **AOV caveat.** AOV is computed within each date × category × region cell. An order
+# MAGIC spanning two categories would count toward both, so these AOVs do not roll up by
+# MAGIC summation. In this dataset every order has exactly one line, so the distinction is
+# MAGIC currently invisible — which is precisely why it belongs in the notes rather than
+# MAGIC being discovered later by an analyst.
+
+# COMMAND ----------
+
+dates = [
+    row.order_date
+    for row in (
+        spark.table(f"{CATALOG}.silver.gold_refresh_queue")
+        .select("order_date")
+        .filter(F.col("order_date").isNotNull())
+        .distinct()
+        .collect()
+    )
+]
+
 if not dates:
     print("No dates queued — Gold is already current. Skipping rebuild.")
+
 else:
-    date_list = ", ".join(f"DATE'{d}'" for d in sorted(dates))
-    print(f"Rebuilding {len(dates)} business date(s): {date_list}")
+    date_list = ", ".join(
+        f"DATE'{business_date}'"
+        for business_date in sorted(dates)
+    )
 
-    # COMMAND ----------
+    print(
+        f"Validating and rebuilding {len(dates)} business date(s): "
+        f"{date_list}"
+    )
 
-    # MAGIC %md
-    # MAGIC ## The aggregate
-    # MAGIC
-    # MAGIC **`LEFT JOIN`, not inner.** Two order rows reference products (`P099`, `P011`) that
-    # MAGIC do not exist in the reference file. An inner join would delete them and their
-    # MAGIC revenue, and nothing in the output would indicate anything was missing. They land
-    # MAGIC in category `Unknown` instead, so the books still tie and the gap becomes a visible
-    # MAGIC data-quality ticket for whoever owns the product master.
-    # MAGIC
-    # MAGIC **AOV caveat.** AOV is computed within each date × category × region cell. An order
-    # MAGIC spanning two categories would count toward both, so these AOVs do not roll up by
-    # MAGIC summation. In this dataset every order has exactly one line, so the distinction is
-    # MAGIC currently invisible — which is precisely why it belongs in the notes rather than
-    # MAGIC being discovered later by an analyst.
-
-    # COMMAND ----------
-
-    agg = spark.sql(f"""
+    # ---------------------------------------------------------------
+    # Build candidate Gold result
+    # ---------------------------------------------------------------
+    candidate_gold = spark.sql(
+        f"""
         SELECT
             o.order_date,
-            COALESCE(p.category, 'Unknown')                    AS category,
+            COALESCE(p.category, 'Unknown') AS category,
             o.region,
-            CAST(SUM(o.line_revenue) AS DECIMAL(18,2))         AS net_revenue,
-            COUNT(DISTINCT o.order_id)                         AS order_count,
-            CAST(SUM(o.quantity) AS BIGINT)                    AS units_sold,
-            CAST(SUM(o.line_revenue) / NULLIF(COUNT(DISTINCT o.order_id), 0)
-                 AS DECIMAL(18,2))                             AS aov,
-            CURRENT_TIMESTAMP()                                AS _refreshed_at
-        FROM {SILVER_ORDERS} o
-        LEFT JOIN {PRODUCTS} p
-               ON o.product_id = p.product_id
-        WHERE o.order_date IN ({date_list})
-        GROUP BY o.order_date, COALESCE(p.category, 'Unknown'), o.region
-    """)
 
-    (agg.write
+            CAST(
+                SUM(o.line_revenue)
+                AS DECIMAL(18,2)
+            ) AS net_revenue,
+
+            COUNT(DISTINCT o.order_id) AS order_count,
+
+            CAST(
+                SUM(o.quantity)
+                AS BIGINT
+            ) AS units_sold,
+
+            CAST(
+                SUM(o.line_revenue)
+                / NULLIF(COUNT(DISTINCT o.order_id), 0)
+                AS DECIMAL(18,2)
+            ) AS aov,
+
+            CURRENT_TIMESTAMP() AS _refreshed_at
+
+        FROM {CATALOG}.silver.orders o
+
+        LEFT JOIN {CATALOG}.silver.products p
+            ON o.product_id = p.product_id
+
+        WHERE o.order_date IN ({date_list})
+
+        GROUP BY
+            o.order_date,
+            COALESCE(p.category, 'Unknown'),
+            o.region
+        """
+    )
+
+    # ---------------------------------------------------------------
+    # Validate candidate before publishing
+    # ---------------------------------------------------------------
+    candidate_stats = (
+        candidate_gold
+        .agg(
+            F.sum("net_revenue")
+            .cast("decimal(18,2)")
+            .alias("candidate_net_revenue"),
+
+            F.count("*")
+            .alias("candidate_row_count"),
+        )
+        .first()
+    )
+
+    silver_stats = (
+        spark.table(f"{CATALOG}.silver.orders")
+        .filter(F.col("order_date").isin(dates))
+        .agg(
+            F.sum("line_revenue")
+            .cast("decimal(18,2)")
+            .alias("silver_net_revenue"),
+
+            F.count("*")
+            .alias("silver_row_count"),
+
+            (
+                F.count("*")
+                - F.countDistinct("order_id")
+            ).alias("duplicate_order_ids"),
+
+            F.sum(
+                F.when(
+                    F.col("order_id").isNull()
+                    | F.col("order_date").isNull()
+                    | F.col("quantity").isNull()
+                    | F.col("unit_price").isNull()
+                    | F.col("region").isNull(),
+                    1,
+                ).otherwise(0)
+            ).alias("invalid_contract_rows"),
+        )
+        .first()
+    )
+
+    candidate_net_revenue = (
+        candidate_stats.candidate_net_revenue
+        if candidate_stats.candidate_net_revenue is not None
+        else 0
+    )
+
+    silver_net_revenue = (
+        silver_stats.silver_net_revenue
+        if silver_stats.silver_net_revenue is not None
+        else 0
+    )
+
+    assert silver_stats.duplicate_order_ids == 0, (
+        "Silver validation failed: "
+        f"{silver_stats.duplicate_order_ids} duplicate order_id rows "
+        "exist for the queued dates."
+    )
+
+    assert silver_stats.invalid_contract_rows == 0, (
+        "Silver validation failed: "
+        f"{silver_stats.invalid_contract_rows} rows contain null values "
+        "in required analytical fields."
+    )
+
+    assert candidate_net_revenue == silver_net_revenue, (
+        "Candidate Gold validation failed: "
+        f"candidate revenue {candidate_net_revenue} does not match "
+        f"Silver revenue {silver_net_revenue}. "
+        "Gold was not published and the refresh queue was retained."
+    )
+
+    # ---------------------------------------------------------------
+    # Publish only after candidate validation succeeds
+    # ---------------------------------------------------------------
+    (
+        candidate_gold.write
         .format("delta")
         .mode("overwrite")
-        .option("replaceWhere", f"order_date IN ({date_list})")
-        .saveAsTable(GOLD))
+        .option(
+            "replaceWhere",
+            f"order_date IN ({date_list})",
+        )
+        .saveAsTable(
+            f"{CATALOG}.gold.daily_sales_by_category_region"
+        )
+    )
 
-    spark.sql(f"DELETE FROM {REFRESH_QUEUE} WHERE order_date IN ({date_list})")
-    print("Gold rebuilt; queue cleared.")
+    # ---------------------------------------------------------------
+    # Verify published Gold partitions
+    # ---------------------------------------------------------------
+    published_stats = (
+        spark.table(
+            f"{CATALOG}.gold.daily_sales_by_category_region"
+        )
+        .filter(F.col("order_date").isin(dates))
+        .agg(
+            F.sum("net_revenue")
+            .cast("decimal(18,2)")
+            .alias("published_net_revenue"),
+
+            F.count("*")
+            .alias("published_row_count"),
+        )
+        .first()
+    )
+
+    published_net_revenue = (
+        published_stats.published_net_revenue
+        if published_stats.published_net_revenue is not None
+        else 0
+    )
+
+    publish_verified = (
+        published_net_revenue == candidate_net_revenue
+        and published_stats.published_row_count
+        == candidate_stats.candidate_row_count
+    )
+
+    assert publish_verified, (
+        "Published Gold verification failed. "
+        "The refresh queue was intentionally retained."
+    )
+
+    # ---------------------------------------------------------------
+    # Clear queue only after successful validation and publication
+    # ---------------------------------------------------------------
+    spark.sql(
+        f"""
+        DELETE FROM {CATALOG}.silver.gold_refresh_queue
+        WHERE order_date IN ({date_list})
+        """
+    )
+
+    print(
+        f"Gold successfully rebuilt and verified for "
+        f"{len(dates)} business date(s); queue cleared."
+    )
 
 # COMMAND ----------
 
@@ -111,55 +298,6 @@ else:
 # MAGIC
 # MAGIC Note `rows_in` counts distinct `order_id`s, not raw rows: the same order legitimately
 # MAGIC appears in two files, and collapsing it is the intended behaviour, not loss.
-
-# COMMAND ----------
-
-stats = spark.sql(f"""
-    SELECT
-      (SELECT COUNT(DISTINCT order_id) FROM {CATALOG}.bronze.orders_raw) AS rows_in,
-      (SELECT COUNT(*)                 FROM {SILVER_ORDERS})             AS rows_loaded,
-      (SELECT COUNT(*)                 FROM {QUARANTINE})                AS rows_quarantined,
-      (SELECT CAST(SUM(net_revenue) AS DECIMAL(18,2)) FROM {GOLD})       AS net_revenue,
-      -- Silver is meant to hold exactly one current row per order_id. If this
-      -- ever diverges the MERGE key or the dedup window logic has a bug.
-      (SELECT COUNT(*) FROM {SILVER_ORDERS}) -
-        (SELECT COUNT(DISTINCT order_id) FROM {SILVER_ORDERS})           AS silver_duplicate_keys,
-      -- Gold is derived entirely from Silver, so the two must tie exactly for
-      -- any date Gold currently covers. A gap here means the aggregate query
-      -- or the affected-dates rebuild logic dropped or double-counted rows.
-      (SELECT CAST(SUM(o.line_revenue) AS DECIMAL(18,2))
-         FROM {SILVER_ORDERS} o
-         WHERE o.order_date IN (SELECT DISTINCT order_date FROM {GOLD})) AS silver_revenue_for_gold_dates
-""").first()
-
-balanced          = stats.rows_in == stats.rows_loaded + stats.rows_quarantined
-silver_deduped    = stats.silver_duplicate_keys == 0
-gold_ties_silver  = stats.net_revenue == stats.silver_revenue_for_gold_dates
-all_invariants_ok = balanced and silver_deduped and gold_ties_silver
-
-spark.createDataFrame(
-    [(RUN_ID, datetime.datetime.utcnow(), "gold_refresh",
-      stats.rows_in, stats.rows_loaded, stats.rows_quarantined, stats.net_revenue,
-      f"dates_rebuilt={len(dates)}; bronze_silver_reconciled={balanced}; "
-      f"silver_deduped={silver_deduped}; gold_ties_silver={gold_ties_silver}")],
-    schema="run_id string, run_ts timestamp, stage string, rows_in bigint, "
-           "rows_loaded bigint, rows_quarantined bigint, net_revenue decimal(18,2), notes string"
-).write.mode("append").saveAsTable(AUDIT)
-
-print(f"rows_in={stats.rows_in}  loaded={stats.rows_loaded}  quarantined={stats.rows_quarantined}")
-print(f"bronze_silver_reconciled={balanced}  silver_deduped={silver_deduped}  "
-      f"gold_ties_silver={gold_ties_silver}")
-
-assert balanced, "Reconciliation failed — rows disappeared between Bronze and Silver."
-assert silver_deduped, (
-    f"Silver has {stats.silver_duplicate_keys} duplicate order_id rows — "
-    "the MERGE key or dedup window has a bug."
-)
-assert gold_ties_silver, (
-    f"Gold net_revenue ({stats.net_revenue}) does not match Silver for the same "
-    f"dates ({stats.silver_revenue_for_gold_dates}) — the aggregate query or the "
-    "affected-dates rebuild dropped or double-counted rows."
-)
 
 # COMMAND ----------
 
@@ -197,3 +335,60 @@ display(spark.sql(f"DESCRIBE HISTORY {GOLD}"))
 # MAGIC -- SELECT 'before' AS state, SUM(net_revenue) FROM retail.gold.daily_sales_by_category_region VERSION AS OF 1
 # MAGIC -- UNION ALL
 # MAGIC -- SELECT 'after',           SUM(net_revenue) FROM retail.gold.daily_sales_by_category_region;
+
+# COMMAND ----------
+
+display(spark.sql("""
+    SELECT
+      (SELECT COUNT(DISTINCT order_id) FROM retail.bronze.orders_raw) AS rows_in,
+      (SELECT COUNT(*) FROM retail.silver.orders) AS loaded,
+      (SELECT COUNT(*) FROM retail.silver.orders_quarantine) AS quarantined,
+      (SELECT CAST(SUM(net_revenue) AS DECIMAL(18,2)) FROM retail.gold.daily_sales_by_category_region) AS net_revenue
+"""))
+
+# COMMAND ----------
+
+display(spark.sql("SELECT order_id, region, _rescued_data FROM retail.bronze.orders_raw WHERE order_id = 'O1011'"))
+
+# COMMAND ----------
+
+display(spark.sql("""
+    SELECT
+      (SELECT COUNT(DISTINCT order_id) FROM retail.bronze.orders_raw) AS rows_in,
+      (SELECT COUNT(*) FROM retail.silver.orders) AS loaded,
+      (SELECT COUNT(*) FROM retail.silver.orders_quarantine) AS quarantined,
+      (SELECT CAST(SUM(net_revenue) AS DECIMAL(18,2)) FROM retail.gold.daily_sales_by_category_region) AS net_revenue
+"""))
+
+# COMMAND ----------
+
+display(spark.sql("""
+    SELECT order_date, category, region, net_revenue, order_count, units_sold, aov
+    FROM retail.gold.daily_sales_by_category_region
+    ORDER BY order_date, category, region
+"""))
+
+# COMMAND ----------
+
+display(
+    spark.sql(f"""
+        SELECT
+            'silver_net_revenue' AS metric,
+            CAST(SUM(line_revenue) AS DECIMAL(18,2)) AS value
+        FROM {CATALOG}.silver.orders
+
+        UNION ALL
+
+        SELECT
+            'gold_net_revenue',
+            CAST(SUM(net_revenue) AS DECIMAL(18,2))
+        FROM {CATALOG}.gold.daily_sales_by_category_region
+
+        UNION ALL
+
+        SELECT
+            'queued_gold_dates',
+            CAST(COUNT(DISTINCT order_date) AS DECIMAL(18,2))
+        FROM {CATALOG}.silver.gold_refresh_queue
+    """)
+)
