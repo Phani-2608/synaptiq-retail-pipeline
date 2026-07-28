@@ -1,30 +1,24 @@
-# Databricks Asset Bundle — deployable definition of the pipeline job.
+# Databricks Declarative Automation Bundle configuration.
 #
-# The job was created through the UI for this exercise, but a job that only exists
-# as clicks in a workspace cannot be code-reviewed, diffed, or promoted between
-# environments. This file is the same job as version-controlled configuration:
+# Validate and deploy with:
 #
 #   databricks bundle validate
 #   databricks bundle deploy -t dev
 #   databricks bundle deploy -t prod
 #
-# Included as evidence of how I'd actually ship this, not as a required step to
-# reproduce the results. Notebook paths below are relative to this repo's flat
-# layout (all files at root); a real deployment would likely split notebooks/
-# and resources/ into subfolders, but I kept this repo's structure simple for
-# review.
+# Notebook paths are relative to this databricks.yml file.
 
 bundle:
   name: retail_daily_sales
 
 variables:
   catalog:
-    description: Target Unity Catalog. Overridden per environment.
+    description: Target Unity Catalog for the deployed environment.
     default: retail
 
 targets:
-  # Development deploys are prefixed and paused, so deploying from a feature
-  # branch cannot fire a job that writes to the shared catalog.
+  # Development mode automatically pauses job triggers, preventing a
+  # development deployment from processing shared production files.
   dev:
     mode: development
     default: true
@@ -40,81 +34,108 @@ resources:
   jobs:
     daily_sales_pipeline:
       name: retail_daily_sales_pipeline
-      description: >
-        Ingests the daily order drop, conforms and deduplicates it, and rebuilds the
-        affected business dates in the Gold sales aggregate.
 
-      # Event-driven rather than cron. The upstream system drops "once per day" but
-      # gives no guarantee of when, so a fixed schedule either runs before the file
-      # lands or wastes compute waiting for it.
+      description: >
+        Ingests incoming retail order and product-reference files,
+        validates and deduplicates orders, quarantines invalid records,
+        and rebuilds affected business dates in the Gold aggregate.
+
+      # Monitor the root of the inbox volume rather than only orders/.
       #
-      # Scoped to the orders/ subpath deliberately: the trigger scans recursively,
-      # and pipeline checkpoints live in a separate volume so that the job's own
-      # writes can never re-trigger it.
+      # Expected structure:
+      #
+      # /Volumes/<catalog>/landing/inbox/orders/
+      # /Volumes/<catalog>/landing/inbox/reference/
+      #
+      # This allows a newly arriving order file or product-reference file
+      # to trigger the complete pipeline.
       trigger:
         file_arrival:
-          url: /Volumes/${var.catalog}/landing/inbox/orders/
-          # Debounce: wait for the write to settle before firing, so a large file
-          # still being uploaded is not read half-written.
+          url: /Volumes/${var.catalog}/landing/inbox/
+
+          # Wait briefly after the last detected change so files have time
+          # to finish uploading before the job starts.
           wait_after_last_change_seconds: 30
+
+          # Prevent several files arriving close together from creating
+          # excessive overlapping job runs.
           min_time_between_triggers_seconds: 60
 
-      # Concurrent runs would race each other's MERGE into silver.orders.
-      # Queue rather than drop, so a file landing mid-run is still processed.
+      # Only one pipeline run may modify the Silver and Gold tables at once.
+      # Additional triggered runs are queued rather than discarded.
       max_concurrent_runs: 1
+
       queue:
         enabled: true
 
       timeout_seconds: 3600
 
-      email_notifications:
-        on_failure:
-          - CHANGE_ME@example.com
-        # Deliberately silent on success. An alert that fires every day is an alert
-        # nobody reads by week three.
-
       tasks:
+        # -------------------------------------------------------------
+        # Bronze ingestion
+        # -------------------------------------------------------------
         - task_key: bronze_ingest
-          description: Auto Loader picks up unprocessed files and appends them to Bronze.
-          # Retried, not the other two tasks. A failure here is almost always
-          # transient (cloud storage listing hiccup, a large file still settling
-          # on write) and Auto Loader's checkpoint makes a retry safe — it will
-          # not reprocess anything already committed.
+
+          description: >
+            Uses Auto Loader to ingest previously unprocessed order files
+            into the Bronze orders table.
+
           max_retries: 2
           min_retry_interval_millis: 30000
+          retry_on_timeout: true
+
           notebook_task:
             notebook_path: ./01_bronze_ingest.py
+
             base_parameters:
               catalog: ${var.catalog}
 
+        # -------------------------------------------------------------
+        # Silver processing
+        # -------------------------------------------------------------
         - task_key: silver
-          description: Parse, validate, quarantine, and upsert on order_id.
+
+          description: >
+            Parses incoming records, quarantines invalid records,
+            deterministically deduplicates orders, records affected
+            business dates, and upserts the latest order assertions.
+
           depends_on:
             - task_key: bronze_ingest
+
           notebook_task:
             notebook_path: ./02_silver.py
+
             base_parameters:
               catalog: ${var.catalog}
-          # Deliberately NOT retried. A failure here is more likely a real data
-          # or logic problem (a MERGE conflict, a constraint violation) than a
-          # transient one, and retrying a task that just wrote a partial MERGE
-          # is a correctness question I want a human to look at, not a policy
-          # to paper over automatically.
 
+          # The notebook uses idempotent Delta MERGE operations, but a
+          # failure may still indicate a schema, constraint, or data-quality
+          # issue that should be inspected rather than repeatedly retried.
+          max_retries: 0
+
+        # -------------------------------------------------------------
+        # Gold aggregation
+        # -------------------------------------------------------------
         - task_key: gold
-          description: Rebuild only the business dates this batch invalidated.
+
+          description: >
+            Builds and validates candidate aggregates for queued business
+            dates, publishes only validated partitions, verifies the
+            published result, and clears the refresh queue after success.
+
           depends_on:
             - task_key: silver
+
           notebook_task:
             notebook_path: ./03_gold.py
+
             base_parameters:
               catalog: ${var.catalog}
-          # Gold ends with reconciliation asserts (Bronze-vs-Silver row balance,
-          # Silver key uniqueness, Gold-vs-Silver revenue tie-out). A failure
-          # here means something is provably wrong, and the run should fail
-          # loudly rather than publish numbers that do not tie back to source
-          # — so this task is also not auto-retried.
 
-# No job_clusters block: all tasks run on serverless compute. On a client engagement
-# with classic compute I would attach a cluster policy here instead, both to cap DBU
-# spend and to stop the job silently upgrading to a larger node type over time.
+          # Validation failures are treated as correctness failures and
+          # should remain visible for investigation.
+          max_retries: 0
+
+# No job_clusters block is required because these notebook tasks use
+# Databricks serverless job compute in the target workspace.
